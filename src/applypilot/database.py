@@ -137,6 +137,24 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
 
+    # Outreach emails table: one row per email in each job's drip sequence
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS outreach_emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_url TEXT NOT NULL,
+            sequence_num INTEGER NOT NULL,
+            subject TEXT,
+            body TEXT,
+            status TEXT DEFAULT 'draft',
+            scheduled_at TEXT,
+            sent_at TEXT,
+            error TEXT,
+            UNIQUE(job_url, sequence_num),
+            FOREIGN KEY (job_url) REFERENCES jobs(url)
+        )
+    """)
+    conn.commit()
+
     return conn
 
 
@@ -180,6 +198,12 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Outreach (hiring manager email + drip campaign)
+    "hm_name": "TEXT",
+    "hm_email": "TEXT",
+    "hm_email_source": "TEXT",
+    "hm_found_at": "TEXT",
+    "outreach_status": "TEXT",
 }
 
 
@@ -321,6 +345,26 @@ def get_stats(conn: sqlite3.Connection | None = None) -> dict:
         "WHERE tailored_resume_path IS NOT NULL "
         "AND applied_at IS NULL "
         "AND application_url IS NOT NULL"
+    ).fetchone()[0]
+
+    # Outreach stage
+    stats["outreach_pending"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE applied_at IS NOT NULL AND (outreach_status IS NULL OR outreach_status = 'pending')"
+    ).fetchone()[0]
+    stats["outreach_needs_email"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs "
+        "WHERE applied_at IS NOT NULL AND hm_email IS NULL "
+        "AND (outreach_status IS NULL OR outreach_status = 'pending')"
+    ).fetchone()[0]
+    stats["outreach_active"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE outreach_status = 'active'"
+    ).fetchone()[0]
+    stats["outreach_completed"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE outreach_status = 'completed'"
+    ).fetchone()[0]
+    stats["outreach_paused"] = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE outreach_status = 'paused'"
     ).fetchone()[0]
 
     return stats

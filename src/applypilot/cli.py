@@ -7,6 +7,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from applypilot import __version__
@@ -451,6 +452,250 @@ def doctor() -> None:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
 
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Outreach (hiring manager drip emails)
+# ---------------------------------------------------------------------------
+
+outreach_app = typer.Typer(
+    name="outreach",
+    help="Find hiring manager emails and send drip campaigns after applying.",
+)
+
+
+@outreach_app.callback(invoke_without_command=True)
+def outreach_main(
+    ctx: typer.Context,
+) -> None:
+    """Run full outreach pipeline: find emails, generate sequences, send due emails."""
+    if ctx.invoked_subcommand is not None:
+        return
+    _bootstrap()
+    from applypilot.config import check_tier
+    check_tier(2, "outreach")
+    import os
+    from applypilot.database import get_connection
+    from applypilot.outreach.finder import run_finder_for_applied_jobs
+    from applypilot.outreach.composer import run_composer_for_pending_jobs
+    from applypilot.outreach.sender import run_send_due_emails
+
+    conn = get_connection()
+    hunter_key = os.environ.get("HUNTER_API_KEY")
+    gmail = os.environ.get("GMAIL_ADDRESS")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+    profile = None
+    try:
+        from applypilot.config import load_profile
+        profile = load_profile()
+        profile_name = (profile.get("personal") or {}).get("preferred_name") or (profile.get("personal") or {}).get("full_name")
+    except Exception:
+        profile_name = None
+
+    console.print("\n[bold blue]Outreach pipeline[/bold blue]")
+    found, skipped = run_finder_for_applied_jobs(conn, hunter_api_key=hunter_key)
+    console.print(f"  Finder: {found} email(s) found, {skipped} skipped (no email found)")
+    gen, errs = run_composer_for_pending_jobs(conn)
+    console.print(f"  Composer: {gen} sequence(s) generated, {errs} error(s)")
+    if gmail and gmail_pass:
+        sent, failed = run_send_due_emails(
+            conn,
+            gmail_address=gmail,
+            gmail_app_password=gmail_pass,
+            from_name=profile_name,
+        )
+        console.print(f"  Sender: {sent} sent, {failed} failed")
+    else:
+        console.print("  [yellow]Skipping send: set GMAIL_ADDRESS and GMAIL_APP_PASSWORD to send emails.[/yellow]")
+    console.print()
+
+
+@outreach_app.command("find")
+def outreach_find(
+    limit: int = typer.Option(50, "--limit", "-l", help="Max jobs to process."),
+) -> None:
+    """Find hiring manager emails for applied jobs (Hunter.io + pattern guessing)."""
+    _bootstrap()
+    from applypilot.config import check_tier
+    check_tier(2, "outreach find")
+    import os
+    from applypilot.database import get_connection
+    from applypilot.outreach.finder import run_finder_for_applied_jobs
+
+    conn = get_connection()
+    hunter_key = os.environ.get("HUNTER_API_KEY")
+    found, skipped = run_finder_for_applied_jobs(conn, hunter_api_key=hunter_key, limit=limit)
+    console.print(f"[green]Found {found} hiring manager email(s), {skipped} skipped.[/green]")
+
+
+@outreach_app.command("send")
+def outreach_send(
+    limit: int = typer.Option(20, "--limit", "-l", help="Max emails to send this run."),
+) -> None:
+    """Send due drip emails (requires GMAIL_ADDRESS and GMAIL_APP_PASSWORD)."""
+    _bootstrap()
+    import os
+    from applypilot.database import get_connection
+    from applypilot.outreach.sender import run_send_due_emails
+    from applypilot.config import load_profile
+
+    gmail = os.environ.get("GMAIL_ADDRESS")
+    gmail_pass = os.environ.get("GMAIL_APP_PASSWORD")
+    if not gmail or not gmail_pass:
+        console.print("[red]Set GMAIL_ADDRESS and GMAIL_APP_PASSWORD in ~/.applypilot/.env[/red]")
+        raise typer.Exit(1)
+    conn = get_connection()
+    profile = load_profile()
+    from_name = (profile.get("personal") or {}).get("preferred_name") or (profile.get("personal") or {}).get("full_name")
+    sent, failed = run_send_due_emails(
+        conn,
+        gmail_address=gmail,
+        gmail_app_password=gmail_pass,
+        from_name=from_name,
+        limit=limit,
+    )
+    console.print(f"[green]Sent {sent}, failed {failed}.[/green]")
+
+
+@outreach_app.command("set-email")
+def outreach_set_email(
+    url: str = typer.Option(..., "--url", "-u", help="Job URL to set hiring manager for."),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Hiring manager name."),
+    email: str = typer.Option(..., "--email", "-e", help="Hiring manager email."),
+) -> None:
+    """Manually set hiring manager name and email for a job."""
+    _bootstrap()
+    from datetime import datetime, timezone
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    row = conn.execute("SELECT url FROM jobs WHERE url = ?", (url,)).fetchone()
+    if not row:
+        console.print("[red]No job found with that URL.[/red]")
+        raise typer.Exit(1)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        UPDATE jobs
+        SET hm_name = ?, hm_email = ?, hm_email_source = 'manual', hm_found_at = ?,
+            outreach_status = COALESCE(outreach_status, 'pending')
+        WHERE url = ?
+        """,
+        (name, email, now, url),
+    )
+    conn.commit()
+    console.print(f"[green]Set hiring manager for job: {name or '(no name)'} <{email}>[/green]")
+
+
+@outreach_app.command("preview")
+def outreach_preview(
+    url: str = typer.Option(..., "--url", "-u", help="Job URL to preview emails for."),
+) -> None:
+    """Preview the 3-email drip sequence for a job (no send)."""
+    _bootstrap()
+    from applypilot.config import check_tier, load_profile
+    check_tier(2, "outreach preview")
+    from applypilot.database import get_connection
+    from applypilot.outreach.composer import generate_sequence
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT url, title, description, full_description, site, location, hm_name, hm_email, applied_at FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row:
+        console.print("[red]No job found with that URL.[/red]")
+        raise typer.Exit(1)
+    job = dict(zip(row.keys(), row))
+    profile = load_profile()
+    console.print("\n[bold]Generated 3-email sequence:[/bold]\n")
+    for em in generate_sequence(job, profile):
+        console.print(Panel(f"[bold]Email {em['sequence_num']}[/bold]\nSubject: {em['subject']}\n\n{em['body']}", title=f"Email {em['sequence_num']}"))
+    console.print()
+
+
+@outreach_app.command("status")
+def outreach_status_cmd() -> None:
+    """Show outreach campaign statistics."""
+    _bootstrap()
+    from applypilot.database import get_connection, get_stats
+
+    stats = get_stats()
+    console.print("\n[bold]Outreach status[/bold]\n")
+    console.print(f"  Pending (applied, no outreach yet):  {stats.get('outreach_pending', 0)}")
+    console.print(f"  Need hiring manager email:          {stats.get('outreach_needs_email', 0)}")
+    console.print(f"  Active campaigns:                    {stats.get('outreach_active', 0)}")
+    console.print(f"  Completed:                            {stats.get('outreach_completed', 0)}")
+    console.print(f"  Paused:                               {stats.get('outreach_paused', 0)}")
+    conn = get_connection()
+    sent = conn.execute("SELECT COUNT(*) FROM outreach_emails WHERE status = 'sent'").fetchone()[0]
+    due = conn.execute(
+        """
+        SELECT COUNT(*) FROM outreach_emails e
+        JOIN jobs j ON j.url = e.job_url
+        WHERE e.status IN ('draft', 'scheduled') AND e.scheduled_at <= datetime('now') AND j.hm_email IS NOT NULL
+        """
+    ).fetchone()[0]
+    console.print(f"  Emails sent (total):                  {sent}")
+    console.print(f"  Emails due to send now:               {due}")
+    console.print()
+
+
+@outreach_app.command("pause")
+def outreach_pause(
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="Job URL to pause."),
+    all_jobs: bool = typer.Option(False, "--all", help="Pause all active campaigns."),
+) -> None:
+    """Pause outreach campaign for a job or all."""
+    _bootstrap()
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    if all_jobs:
+        cur = conn.execute("UPDATE jobs SET outreach_status = 'paused' WHERE outreach_status = 'active'")
+        conn.commit()
+        console.print(f"[yellow]Paused {cur.rowcount} campaign(s).[/yellow]")
+    elif url:
+        cur = conn.execute("UPDATE jobs SET outreach_status = 'paused' WHERE url = ?", (url,))
+        conn.commit()
+        if cur.rowcount:
+            console.print(f"[yellow]Paused campaign for job.[/yellow]")
+        else:
+            console.print("[red]No job found or not active.[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print("[red]Provide --url or --all.[/red]")
+        raise typer.Exit(1)
+
+
+@outreach_app.command("resume")
+def outreach_resume(
+    url: Optional[str] = typer.Option(None, "--url", "-u", help="Job URL to resume."),
+    all_jobs: bool = typer.Option(False, "--all", help="Resume all paused campaigns."),
+) -> None:
+    """Resume paused outreach campaign(s)."""
+    _bootstrap()
+    from applypilot.database import get_connection
+
+    conn = get_connection()
+    if all_jobs:
+        cur = conn.execute("UPDATE jobs SET outreach_status = 'active' WHERE outreach_status = 'paused'")
+        conn.commit()
+        console.print(f"[green]Resumed {cur.rowcount} campaign(s).[/green]")
+    elif url:
+        cur = conn.execute("UPDATE jobs SET outreach_status = 'active' WHERE url = ? AND outreach_status = 'paused'", (url,))
+        conn.commit()
+        if cur.rowcount:
+            console.print("[green]Resumed campaign for job.[/green]")
+        else:
+            console.print("[red]No paused job found with that URL.[/red]")
+            raise typer.Exit(1)
+    else:
+        console.print("[red]Provide --url or --all.[/red]")
+        raise typer.Exit(1)
+
+
+app.add_typer(outreach_app, name="outreach")
 
 
 if __name__ == "__main__":

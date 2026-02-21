@@ -170,6 +170,9 @@ DEFAULTS = {
     "viewport": "1280x900",
 }
 
+# Outreach drip schedule: days after first email for each follow-up (Day 0, +2, +5)
+DRIP_SCHEDULE = [0, 2, 5]
+
 
 def load_env():
     """Load environment variables from ~/.applypilot/.env if it exists."""
