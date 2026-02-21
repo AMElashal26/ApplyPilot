@@ -6,7 +6,7 @@ import smtplib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-import httpx
+import httpx  # pyright: ignore[reportMissingImports]
 
 log = logging.getLogger(__name__)
 
